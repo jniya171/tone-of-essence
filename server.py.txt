@@ -1,0 +1,283 @@
+import os
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+import stripe
+
+app = Flask(__name__)
+
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+
+SITE_URL = os.environ.get(
+"SITE_URL",
+"https://tone-of-essence-2.onrender.com"
+).rstrip("/")
+
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+if not STRIPE_SECRET_KEY:
+raise RuntimeError("STRIPE_SECRET_KEY is missing from Render environment variables.")
+
+# Current Stripe Python SDK uses StripeClient.
+client = stripe.StripeClient(STRIPE_SECRET_KEY)
+
+
+# ---------------------------------------------------------
+# STRIPE PRICE IDs
+#
+# IMPORTANT:
+# Put the REAL Stripe Price IDs in Render.
+#
+# Example:
+# price_123456789
+#
+# DO NOT put sk_live_... here.
+# ---------------------------------------------------------
+
+PRICE_IDS = {
+"hair-oil-2oz": os.environ.get("PRICE_HAIR_OIL_2OZ"),
+"hair-oil-4oz": os.environ.get("PRICE_HAIR_OIL_4OZ"),
+"hair-oil-8oz": os.environ.get("PRICE_HAIR_OIL_8OZ"),
+
+"body-oil-8oz": os.environ.get("PRICE_BODY_OIL_8OZ"),
+
+"botanical-salt-scrub": os.environ.get(
+"PRICE_BOTANICAL_SALT_SCRUB"
+),
+
+"turmeric-scrub": os.environ.get(
+"PRICE_TURMERIC_SCRUB"
+),
+
+"african-black-soap": os.environ.get(
+"PRICE_AFRICAN_BLACK_SOAP"
+),
+
+"botanical-hand-sanitizer": os.environ.get(
+"PRICE_BOTANICAL_HAND_SANITIZER"
+),
+
+"loc-retwist-deposit": os.environ.get(
+"PRICE_LOC_RETWIST_DEPOSIT"
+),
+
+"wash-retwist": os.environ.get(
+"PRICE_WASH_RETWIST"
+),
+
+"luxury-makeup-deposit": os.environ.get(
+"PRICE_LUXURY_MAKEUP_DEPOSIT"
+),
+
+"luxury-makeup-balance": os.environ.get(
+"PRICE_LUXURY_MAKEUP_BALANCE"
+),
+}
+
+
+# ---------------------------------------------------------
+# SERVE ONLY PUBLIC WEBSITE FILES
+# ---------------------------------------------------------
+
+PUBLIC_FILES = {
+"index.html",
+"products.html",
+"services.html",
+"contact.html",
+"marketing.html",
+"story.html",
+"success.html",
+"cancel.html",
+}
+
+
+@app.route("/")
+def home():
+return send_from_directory(BASE_DIR, "index.html")
+
+
+@app.route("/<filename>")
+def public_page(filename):
+if filename in PUBLIC_FILES:
+return send_from_directory(BASE_DIR, filename)
+
+return jsonify({"error": "Page not found"}), 404
+
+
+@app.route("/images/<path:filename>")
+def images(filename):
+images_dir = BASE_DIR / "images"
+
+return send_from_directory(images_dir, filename)
+
+
+# ---------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------
+
+@app.route("/health")
+def health():
+return jsonify({
+"status": "ok",
+"stripe_configured": bool(STRIPE_SECRET_KEY)
+})
+
+
+# ---------------------------------------------------------
+# CREATE SECURE STRIPE CHECKOUT SESSION
+# ---------------------------------------------------------
+
+@app.post("/create-checkout-session")
+def create_checkout_session():
+
+data = request.get_json(silent=True) or {}
+
+product_key = data.get("product")
+
+if not product_key:
+return jsonify({
+"error": "No product was selected."
+}), 400
+
+# NEVER accept the price from the browser.
+# We only accept a product key and look up its Stripe Price ID
+# on the server.
+price_id = PRICE_IDS.get(product_key)
+
+if not price_id:
+return jsonify({
+"error": "This product is not currently available for checkout."
+}), 400
+
+try:
+
+session = client.v1.checkout.sessions.create({
+"mode": "payment",
+
+"line_items": [
+{
+"price": price_id,
+"quantity": 1
+}
+],
+
+"success_url": (
+f"{SITE_URL}/success.html"
+"?session_id={CHECKOUT_SESSION_ID}"
+),
+
+"cancel_url": (
+f"{SITE_URL}/cancel.html"
+),
+
+"billing_address_collection": "auto",
+
+"phone_number_collection": {
+"enabled": True
+},
+
+"metadata": {
+"brand": "Tone of Essence",
+"product_key": product_key
+}
+})
+
+return jsonify({
+"url": session.url
+})
+
+except Exception as e:
+
+print("Stripe Checkout error:", str(e))
+
+return jsonify({
+"error": "Unable to create secure checkout."
+}), 500
+
+
+# ---------------------------------------------------------
+# STRIPE WEBHOOK
+#
+# Stripe uses this to tell your server that payment
+# actually happened.
+# ---------------------------------------------------------
+
+@app.post("/stripe-webhook")
+def stripe_webhook():
+
+payload = request.get_data()
+signature = request.headers.get("Stripe-Signature")
+
+if not STRIPE_WEBHOOK_SECRET:
+return jsonify({
+"error": "Webhook secret is not configured."
+}), 500
+
+try:
+
+event = stripe.Webhook.construct_event(
+payload,
+signature,
+STRIPE_WEBHOOK_SECRET
+)
+
+except ValueError:
+return jsonify({
+"error": "Invalid webhook payload."
+}), 400
+
+except stripe.error.SignatureVerificationError:
+return jsonify({
+"error": "Invalid webhook signature."
+}), 400
+
+event_type = event["type"]
+
+if event_type == "checkout.session.completed":
+
+session = event["data"]["object"]
+
+print(
+"SUCCESSFUL PAYMENT:",
+session.get("id"),
+session.get("payment_status")
+)
+
+# This is where you can later add:
+# - order database storage
+# - confirmation email
+# - inventory updates
+# - booking confirmation
+# - fulfillment
+
+elif event_type == "checkout.session.async_payment_succeeded":
+
+session = event["data"]["object"]
+
+print(
+"ASYNC PAYMENT SUCCESS:",
+session.get("id")
+)
+
+return jsonify({
+"received": True
+})
+
+
+# ---------------------------------------------------------
+# RUN SERVER
+# ---------------------------------------------------------
+
+if __name__ == "__main__":
+
+port = int(os.environ.get("PORT", 5000))
+
+app.run(
+host="0.0.0.0",
+port=port
+)
